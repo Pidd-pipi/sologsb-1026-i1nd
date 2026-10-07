@@ -9,13 +9,22 @@
     Tag,
     TextArea,
     TextInput,
-    Tile
+    Tile,
+    ToastNotification
   } from 'carbon-components-svelte';
 
   type ActivityType = '音素' | '单词' | '句子' | '练习';
   type ViewMode = 'compose' | 'path' | 'issues' | 'versions';
   type PreviewWidth = 'phone' | 'tablet' | 'desktop';
   type IssueLevel = 'error' | 'warning' | 'info';
+  type CourseStatus = 'draft' | 'published';
+  type NoticeKind = 'error' | 'success' | 'info' | 'warning';
+
+  interface Teacher {
+    id: string;
+    name: string;
+    role: string;
+  }
 
   interface Activity {
     id: string;
@@ -39,14 +48,28 @@
     activities: Activity[];
   }
 
+  interface CourseRelease {
+    id: string;
+    label: string;
+    savedAt: string;
+    note: string;
+    publishedBy: string;
+    activities: Activity[];
+  }
+
   interface Course {
     id: string;
     title: string;
     level: string;
     ageRange: string;
     objective: string;
+    ownerId: string;
+    status: CourseStatus;
     activities: Activity[];
     versions: CourseVersion[];
+    releases: CourseRelease[];
+    publishedReleaseId: string | null;
+    revision: number;
     updatedAt: string;
   }
 
@@ -67,6 +90,17 @@
   }
 
   const STORAGE_KEY = 'sologsb-1026-phonics-course-v1';
+  const USER_KEY = 'sologsb-1026-current-user';
+  const LOCK_KEY = 'sologsb-1026-publish-lock';
+  const LOCK_TTL_MS = 5000;
+
+  const teachers: Teacher[] = [
+    { id: 't-wang', name: '王雪梅', role: '教研组长' },
+    { id: 't-li', name: '李一鸣', role: '自然拼读教师' },
+    { id: 't-chen', name: '陈可', role: '自然拼读教师' },
+    { id: 't-zhao', name: '赵之衡', role: '课程顾问' }
+  ];
+
   const confusablePairs = [
     ['/b/', '/p/'], ['/d/', '/t/'], ['/f/', '/v/'], ['/m/', '/n/'], ['/ɪ/', '/iː/'], ['/æ/', '/e/']
   ];
@@ -77,6 +111,10 @@
     level: '启蒙一级',
     ageRange: '5–6 岁',
     objective: '建立音素意识，能听辨、拼读并书写短元音单词。',
+    ownerId: 't-wang',
+    status: 'published',
+    publishedReleaseId: 'rel-1',
+    revision: 2,
     updatedAt: '2026-09-24T16:20:00+08:00',
     activities: [
       {
@@ -154,15 +192,43 @@
           }
         ]
       }
+    ],
+    releases: [
+      {
+        id: 'rel-1',
+        label: '第 1 次发布',
+        savedAt: '2026-09-24T16:20:00+08:00',
+        publishedBy: 't-wang',
+        note: '定稿 4 个活动 · 34 分钟。',
+        activities: [
+          {
+            id: 'a-1', type: '音素', title: '听音游戏：认识 /m/', content: '/m/', phonemes: ['/m/'], dependencies: [], difficulty: 1,
+            prompt: '闭上嘴唇，轻轻发出 /m/。', accessibility: '口型示范和重复音频。', duration: 6, feedback: ''
+          },
+          {
+            id: 'a-2', type: '音素', title: '首音识别：/s/ 与 /m/', content: '/s/ /m/', phonemes: ['/s/', '/m/'], dependencies: ['a-1'], difficulty: 1,
+            prompt: '听到单词时拍手。', accessibility: '不同形状的视觉提示。', duration: 8, feedback: ''
+          },
+          {
+            id: 'a-3', type: '单词', title: '拼读短词：sat', content: 's – a – t → sat', phonemes: ['/s/', '/æ/', '/t/'], dependencies: ['a-2'], difficulty: 2,
+            prompt: '用手指依次点每个字母。', accessibility: '键盘逐字聚焦。', duration: 10, feedback: '形成完整电路。'
+          },
+          {
+            id: 'a-6', type: '句子', title: '拼读句子：Mat sat.', content: 'Mat sat on the mat.', phonemes: ['/m/', '/æ/', '/s/', '/t/'], dependencies: ['a-3'], difficulty: 3,
+            prompt: '先读每个单词，再按意群连读。', accessibility: '按词高亮。', duration: 10, feedback: '再试试更连贯。'
+          }
+        ]
+      }
     ]
   });
 
   let course: Course = initialCourse();
+  let currentUserId = teachers[0].id;
   let selectedActivityId = course.activities[0]?.id ?? '';
   let activeView: ViewMode = 'compose';
   let previewWidth: PreviewWidth = 'desktop';
-  let compareBaseId = course.versions[0]?.id ?? '';
-  let compareTargetId = course.versions.at(-1)?.id ?? '';
+  let compareBaseId = course.releases[0]?.id ?? '';
+  let compareTargetId = course.releases.at(-1)?.id ?? '';
   let hydrated = false;
   let online = true;
   let savedLabel = '等待载入';
@@ -170,30 +236,42 @@
   let history: Course[] = [];
   let future: Course[] = [];
   let selectedActivity: Activity | null = null;
-  let diagnostics: Diagnostic[] = [];
-  let versionDiff: VersionDiff[] = [];
+  let notice: { kind: NoticeKind; title: string; subtitle: string } | null = null;
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 
   $: selectedActivity = course.activities.find((activity) => activity.id === selectedActivityId) ?? course.activities[0] ?? null;
-  $: diagnostics = analyzeCourse(course);
-  $: versionDiff = compareCourseVersions(course, compareBaseId, compareTargetId);
-  $: errorCount = diagnostics.filter((issue) => issue.level === 'error').length;
-  $: warningCount = diagnostics.filter((issue) => issue.level === 'warning').length;
+  $: currentTeacher = teachers.find((teacher) => teacher.id === currentUserId) ?? teachers[0];
+  $: isOwner = currentUserId === course.ownerId;
+  $: currentRelease = course.releases.find((release) => release.id === course.publishedReleaseId) ?? course.releases.at(-1) ?? null;
+  $: releaseDiagnostics = currentRelease ? analyzeActivities(currentRelease.activities) : [];
+  $: draftDiagnostics = analyzeActivities(course.activities);
+  $: versionDiff = compareSnapshots(course.releases, compareBaseId, compareTargetId);
+  $: errorCount = releaseDiagnostics.filter((issue) => issue.level === 'error').length;
+  $: warningCount = releaseDiagnostics.filter((issue) => issue.level === 'warning').length;
+  $: draftErrorCount = draftDiagnostics.filter((issue) => issue.level === 'error').length;
   $: totalMinutes = course.activities.reduce((sum, activity) => sum + activity.duration, 0);
+  $: statusLabel = course.status === 'published' ? '已发布' : '草稿';
 
   onMount(() => {
+    let migrated = false;
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
       try {
         course = migrateCourse(JSON.parse(stored) as Course);
+        migrated = true;
         selectedActivityId = course.activities[0]?.id ?? '';
-        compareBaseId = course.versions[0]?.id ?? '';
-        compareTargetId = course.versions.at(-1)?.id ?? '';
+        compareBaseId = course.releases[0]?.id ?? '';
+        compareTargetId = course.releases.at(-1)?.id ?? '';
         savedLabel = `已恢复 · ${formatTime(course.updatedAt)}`;
       } catch {
         localStorage.removeItem(STORAGE_KEY);
       }
     }
+    const storedUser = localStorage.getItem(USER_KEY);
+    if (storedUser && teachers.some((teacher) => teacher.id === storedUser)) currentUserId = storedUser;
     hydrated = true;
+    // 旧数据升级后立即写回，让负责人与发布状态的补全持久生效
+    if (migrated) localStorage.setItem(STORAGE_KEY, JSON.stringify(course));
     const updateNetwork = () => {
       online = navigator.onLine;
       showOfflineNotice = !online;
@@ -201,15 +279,30 @@
     updateNetwork();
     window.addEventListener('online', updateNetwork);
     window.addEventListener('offline', updateNetwork);
+    window.addEventListener('storage', handleStorageSync);
     return () => {
       window.removeEventListener('online', updateNetwork);
       window.removeEventListener('offline', updateNetwork);
+      window.removeEventListener('storage', handleStorageSync);
+      clearTimeout(noticeTimer);
     };
   });
 
   function migrateCourse(value: Course): Course {
     if (!value.id || !Array.isArray(value.activities)) return initialCourse();
+    // 旧数据升级：为老课程补齐负责人、发布状态与发布记录
     value.versions ??= [];
+    value.releases ??= [];
+    value.ownerId ??= teachers[0].id;
+    value.publishedReleaseId ??= value.releases.at(-1)?.id ?? null;
+    value.status ??= value.publishedReleaseId ? 'published' : 'draft';
+    if (value.publishedReleaseId && value.releases.some((release) => release.id === value.publishedReleaseId)) {
+      value.status = 'published';
+    }
+    value.revision ??= 1;
+    value.releases.forEach((release) => {
+      release.publishedBy ??= value.ownerId;
+    });
     return value;
   }
 
@@ -251,6 +344,153 @@
 
   function saveNow(): void {
     persist();
+  }
+
+  function notify(kind: NoticeKind, title: string, subtitle: string): void {
+    notice = { kind, title, subtitle };
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => { notice = null; }, 6500);
+  }
+
+  function teacherName(id: string): string {
+    return teachers.find((teacher) => teacher.id === id)?.name ?? '未指定';
+  }
+
+  function switchTeacher(id: string): void {
+    if (!teachers.some((teacher) => teacher.id === id) || id === currentUserId) return;
+    currentUserId = id;
+    if (hydrated) localStorage.setItem(USER_KEY, id);
+    const teacher = teachers.find((item) => item.id === id);
+    notify(
+      'info',
+      '已切换当前教师',
+      id === course.ownerId
+        ? `现在以负责人 ${teacher?.name} 的身份操作，可以发布本课程。`
+        : `现在以 ${teacher?.name} 的身份操作；本课程负责人是 ${teacherName(course.ownerId)}，你无法发布。`
+    );
+  }
+
+  function transferOwnership(id: string): void {
+    if (!isOwner || id === course.ownerId) return;
+    commit((draft) => { draft.ownerId = id; });
+    notify('success', '负责人已更新', `本课程负责人已调整为 ${teacherName(id)}，之后只有他能发布本课程。`);
+  }
+
+  function readStoredCourse(): Course | null {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? migrateCourse(JSON.parse(raw) as Course) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function acquirePublishLock(token: string): boolean {
+    const now = Date.now();
+    try {
+      const raw = localStorage.getItem(LOCK_KEY);
+      if (raw) {
+        const lock = JSON.parse(raw) as { token?: string; at?: number };
+        if (lock.token !== token && typeof lock.at === 'number' && now - lock.at < LOCK_TTL_MS) return false;
+      }
+      localStorage.setItem(LOCK_KEY, JSON.stringify({ token, at: now }));
+      const confirm = JSON.parse(localStorage.getItem(LOCK_KEY) ?? '{}') as { token?: string };
+      return confirm.token === token;
+    } catch {
+      return false;
+    }
+  }
+
+  function releasePublishLock(token: string): void {
+    try {
+      const raw = localStorage.getItem(LOCK_KEY);
+      if (raw && (JSON.parse(raw) as { token?: string }).token === token) localStorage.removeItem(LOCK_KEY);
+    } catch {
+      // 锁到期会自动失效，无需处理
+    }
+  }
+
+  function publishCourse(): void {
+    if (!isOwner) {
+      notify('error', '发布被拒绝', `只有课程负责人 ${teacherName(course.ownerId)} 能发布本课程，你当前以 ${currentTeacher.name} 的身份操作。`);
+      return;
+    }
+    const before = structuredClone(course);
+    const token = `publish-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    if (!acquirePublishLock(token)) {
+      rollbackPublish(before, readStoredCourse(), '另一位老师正在发布本课程，请稍后重试。');
+      return;
+    }
+    try {
+      const stored = readStoredCourse();
+      if (stored && stored.revision !== course.revision) {
+        rollbackPublish(before, stored, '另一位老师已抢先发布，本次发布未生效。');
+        return;
+      }
+      const next = structuredClone(course);
+      const releaseNumber = next.releases.length + 1;
+      const minutes = next.activities.reduce((sum, item) => sum + item.duration, 0);
+      const release: CourseRelease = {
+        id: `rel-${Date.now()}`,
+        label: `第 ${releaseNumber} 次发布`,
+        savedAt: new Date().toISOString(),
+        publishedBy: currentUserId,
+        note: `定稿 ${next.activities.length} 个活动 · ${minutes} 分钟。`,
+        activities: structuredClone(next.activities)
+      };
+      next.releases = [...next.releases, release];
+      next.status = 'published';
+      next.publishedReleaseId = release.id;
+      next.revision += 1;
+      next.updatedAt = new Date().toISOString();
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      const confirm = readStoredCourse();
+      if (!confirm || confirm.revision !== next.revision || confirm.publishedReleaseId !== release.id) {
+        rollbackPublish(before, confirm, '发布结果未能写入本地存储。');
+        return;
+      }
+      course = next;
+      // 发布是对外动作，不作为可撤销的草稿编辑
+      history = [];
+      future = [];
+      compareBaseId = next.releases.at(-2)?.id ?? release.id;
+      compareTargetId = release.id;
+      savedLabel = `已发布 · ${formatTime(release.savedAt)}`;
+      notify('success', '发布成功', `${release.label} 已成为定稿，质量检查与版本比较将以该版为准。`);
+    } catch {
+      rollbackPublish(before, readStoredCourse(), '发布过程中出现异常。');
+    } finally {
+      releasePublishLock(token);
+    }
+  }
+
+  function rollbackPublish(before: Course, stored: Course | null, reason: string): void {
+    // 发布失败：恢复成发布前的样子，同时采纳存储中他人已发布的定稿信息
+    const restored = structuredClone(before);
+    if (stored) {
+      restored.releases = stored.releases;
+      restored.status = stored.status;
+      restored.publishedReleaseId = stored.publishedReleaseId;
+      restored.revision = stored.revision;
+    }
+    course = restored;
+    savedLabel = '发布失败 · 已恢复';
+    notify('error', '发布未完成', `${reason} 已恢复为发布前的状态。`);
+  }
+
+  function handleStorageSync(event: StorageEvent): void {
+    if (event.key !== STORAGE_KEY || !event.newValue || !hydrated) return;
+    const stored = readStoredCourse();
+    if (!stored || stored.revision === course.revision) return;
+    // 其他窗口发布了新定稿：同步发布相关信息，本地草稿内容保持不变
+    const draft = structuredClone(course);
+    draft.releases = stored.releases;
+    draft.status = stored.status;
+    draft.publishedReleaseId = stored.publishedReleaseId;
+    draft.revision = stored.revision;
+    draft.ownerId = stored.ownerId;
+    course = draft;
+    notify('info', '已同步发布状态', '另一位老师在其他窗口发布了新定稿，本地草稿保持不变。');
   }
 
   function updateCourse(field: 'title' | 'level' | 'ageRange' | 'objective', value: string): void {
@@ -350,21 +590,6 @@
     updateActivity('phonemes', value.split(/[\s,，、]+/).map((item) => item.trim()).filter(Boolean));
   }
 
-  function saveVersion(): void {
-    const versionNumber = course.versions.length + 1;
-    commit((draft) => {
-      draft.versions.push({
-        id: `v-${Date.now()}`, label: `版本 ${versionNumber}`, savedAt: new Date().toISOString(),
-        note: `保存 ${draft.activities.length} 个活动，总计 ${draft.activities.reduce((sum, item) => sum + item.duration, 0)} 分钟。`,
-        activities: structuredClone(draft.activities)
-      });
-    });
-    const latest = course.versions.at(-1);
-    compareTargetId = latest?.id ?? '';
-    if (!compareBaseId) compareBaseId = course.versions.at(-2)?.id ?? '';
-    savedLabel = `版本 ${versionNumber} 已存档`;
-  }
-
   function copyCourse(): void {
     commit((draft) => {
       const copy = structuredClone(draft);
@@ -376,10 +601,19 @@
       });
       draft.id = copy.id;
       draft.title = copy.title;
-      draft.versions = copy.versions;
+      draft.versions = [];
       draft.activities = copy.activities;
+      // 副本是全新的草稿：不带走定稿，操作者成为新课程的负责人
+      draft.releases = [];
+      draft.status = 'draft';
+      draft.publishedReleaseId = null;
+      draft.ownerId = currentUserId;
+      draft.revision = 1;
     });
+    compareBaseId = '';
+    compareTargetId = '';
     savedLabel = '课程已复制为新草稿';
+    notify('info', '课程已复制', '副本是未发布的新草稿，你是新课程的负责人。');
   }
 
   function focusIssue(issue: Diagnostic): void {
@@ -387,12 +621,12 @@
     activeView = 'compose';
   }
 
-  function analyzeCourse(current: Course): Diagnostic[] {
+  function analyzeActivities(activities: Activity[]): Diagnostic[] {
     const issues: Diagnostic[] = [];
     const learned = new Set<string>();
     const seenPhonemes: Array<{ activity: Activity; phoneme: string }> = [];
 
-    current.activities.forEach((activity, index) => {
+    activities.forEach((activity, index) => {
       activity.phonemes.forEach((phoneme) => {
         if (!learned.has(phoneme) && activity.type !== '音素') {
           issues.push({
@@ -427,7 +661,7 @@
       });
 
       activity.dependencies.forEach((dependency) => {
-        if (!current.activities.some((item) => item.id === dependency)) issues.push({
+        if (!activities.some((item) => item.id === dependency)) issues.push({
           id: `missing-dep-${activity.id}-${dependency}`, activityId: activity.id, level: 'error', category: '依赖缺失',
           title: `${activity.title} 的依赖已不存在`, detail: '请移除失效依赖或重新选择前置活动。'
         });
@@ -444,7 +678,7 @@
       });
     });
 
-    const cycle = findDependencyCycle(current.activities);
+    const cycle = findDependencyCycle(activities);
     if (cycle) issues.push({
       id: 'cycle', activityId: cycle[0], level: 'error', category: '依赖关系',
       title: '活动依赖形成循环', detail: cycle.join(' → ')
@@ -478,9 +712,9 @@
     return cycle.length ? cycle : null;
   }
 
-  function compareCourseVersions(current: Course, baseId: string, targetId: string): VersionDiff[] {
-    const base = current.versions.find((version) => version.id === baseId);
-    const target = current.versions.find((version) => version.id === targetId);
+  function compareSnapshots(snapshots: Array<{ id: string; activities: Activity[] }>, baseId: string, targetId: string): VersionDiff[] {
+    const base = snapshots.find((snapshot) => snapshot.id === baseId);
+    const target = snapshots.find((snapshot) => snapshot.id === targetId);
     if (!base || !target) return [];
     const rows: VersionDiff[] = [];
     const baseMap = new Map(base.activities.map((activity) => [activity.id, activity]));
@@ -565,10 +799,15 @@
       <strong>{savedLabel}</strong>
     </div>
     <div class="header-actions">
+      <div class="teacher-switcher">
+        <Select inline labelText="当前教师" selected={currentUserId} on:change={(event) => switchTeacher(readText(event))}>
+          {#each teachers as teacher}<SelectItem value={teacher.id} text={`${teacher.name} · ${teacher.role}`} />{/each}
+        </Select>
+      </div>
       <Button size="small" kind="ghost" disabled={history.length === 0} on:click={undo}>撤销</Button>
       <Button size="small" kind="ghost" disabled={future.length === 0} on:click={redo}>重做</Button>
       <Button size="small" kind="tertiary" on:click={saveNow}>保存</Button>
-      <Button size="small" kind="primary" on:click={saveVersion}>存档版本</Button>
+      <Button size="small" kind="primary" on:click={publishCourse}>发布课程</Button>
     </div>
   </header>
 
@@ -578,11 +817,22 @@
     </div>
   {/if}
 
+  {#if notice}
+    <div class="notice-stack">
+      <ToastNotification kind={notice.kind} title={notice.title} subtitle={notice.subtitle} timeout={6500} on:close={() => (notice = null)} />
+    </div>
+  {/if}
+
   <section class="course-hero">
     <div class="hero-copy">
       <span class="kicker">COURSE BUILDER / {course.level}</span>
       <h2>{course.title}</h2>
       <p>{course.objective}</p>
+      <div class="hero-meta">
+        <Tag type={course.status === 'published' ? 'green' : 'warm-gray'}>{statusLabel}</Tag>
+        <span>负责人：{teacherName(course.ownerId)}</span>
+        <span>{currentRelease ? `当前定稿：${currentRelease.label} · ${formatTime(currentRelease.savedAt)}` : '尚未发布定稿'}</span>
+      </div>
     </div>
     <div class="hero-stats">
       <div><strong>{course.activities.length}</strong><span>活动</span></div>
@@ -595,8 +845,8 @@
   <nav class="workspace-tabs" aria-label="工作区">
     <button class:active={activeView === 'compose'} on:click={() => activeView = 'compose'}><span>01</span><b>课程编排</b><small>活动、依赖与教学说明</small></button>
     <button class:active={activeView === 'path'} on:click={() => activeView = 'path'}><span>02</span><b>学习路径</b><small>多屏幕顺序预览</small></button>
-    <button class:active={activeView === 'issues'} on:click={() => activeView = 'issues'}><span>03</span><b>质量检查</b><small>音素、句子与反馈</small></button>
-    <button class:active={activeView === 'versions'} on:click={() => activeView = 'versions'}><span>04</span><b>版本与复用</b><small>复制、存档与比较</small></button>
+    <button class:active={activeView === 'issues'} on:click={() => activeView = 'issues'}><span>03</span><b>质量检查</b><small>针对已发布定稿</small></button>
+    <button class:active={activeView === 'versions'} on:click={() => activeView = 'versions'}><span>04</span><b>发布与版本</b><small>负责人、定稿与比较</small></button>
   </nav>
 
   {#if activeView === 'compose'}
@@ -686,16 +936,21 @@
           <TextInput labelText="课程等级" value={course.level} on:input={(event) => updateCourse('level', readText(event))} />
           <TextInput labelText="适用年龄" value={course.ageRange} on:input={(event) => updateCourse('ageRange', readText(event))} />
           <TextArea labelText="学习目标" rows={3} value={course.objective} on:input={(event) => updateCourse('objective', readText(event))} />
+          <Select labelText="课程负责人" selected={course.ownerId} disabled={!isOwner} on:change={(event) => transferOwnership(readText(event))}>
+            {#each teachers as teacher}<SelectItem value={teacher.id} text={`${teacher.name} · ${teacher.role}`} />{/each}
+          </Select>
+          {#if !isOwner}<p class="field-hint">只有当前负责人 {teacherName(course.ownerId)} 能调整归属或发布本课程。</p>{/if}
         </Tile>
         <Tile class="compact-card issue-peek">
-          <div class="section-title"><div><span class="kicker">LIVE CHECK</span><h3>实时提示</h3></div><Tag type={errorCount ? 'red' : 'green'}>{errorCount ? `${errorCount} 项` : '通过'}</Tag></div>
-          {#each diagnostics.slice(0, 4) as issue}
+          <div class="section-title"><div><span class="kicker">LIVE CHECK</span><h3>草稿实时提示</h3></div><Tag type={draftErrorCount ? 'red' : 'green'}>{draftErrorCount ? `${draftErrorCount} 项` : '通过'}</Tag></div>
+          {#each draftDiagnostics.slice(0, 4) as issue}
             <button on:click={() => focusIssue(issue)} class="peek-row">
               <i class:error={issue.level === 'error'} class:warning={issue.level === 'warning'}></i>
               <span><b>{issue.title}</b><small>{issue.category}</small></span>
             </button>
           {/each}
-          {#if diagnostics.length === 0}<p class="empty-state">课程结构完整，没有发现提示。</p>{/if}
+          {#if draftDiagnostics.length === 0}<p class="empty-state">草稿结构完整，没有发现提示。</p>{/if}
+          <p class="peek-note">质量检查与版本比较以已发布定稿为准。</p>
           <Button size="small" kind="ghost" on:click={() => activeView = 'issues'}>查看全部检查</Button>
         </Tile>
       </aside>
@@ -744,70 +999,111 @@
     <main class="issues-view">
       <div class="view-heading">
         <div><span class="kicker">CURRICULUM QA</span><h2>课程质量检查</h2><p>检查前置知识、相似音、例句长度、练习反馈、无障碍说明和依赖完整性。</p></div>
-        <div class="issue-summary"><span><b>{errorCount}</b> 必须处理</span><span><b>{warningCount}</b> 建议调整</span><span><b>{diagnostics.length}</b> 全部提示</span></div>
+        <div class="issue-summary"><span><b>{errorCount}</b> 必须处理</span><span><b>{warningCount}</b> 建议调整</span><span><b>{releaseDiagnostics.length}</b> 全部提示</span></div>
       </div>
-      <div class="issue-board">
-        {#each diagnostics as issue, index}
-          <article class:critical={issue.level === 'error'} class:caution={issue.level === 'warning'} class:info={issue.level === 'info'}>
-            <span class="issue-index">{String(index + 1).padStart(2, '0')}</span>
-            <div><div class="issue-meta"><Tag type={issue.level === 'error' ? 'red' : issue.level === 'warning' ? 'magenta' : 'blue'}>{issue.category}</Tag><small>{issue.level === 'error' ? '必须处理' : issue.level === 'warning' ? '建议调整' : '教学提示'}</small></div><h3>{issue.title}</h3><p>{issue.detail}</p></div>
-            <Button size="small" kind="ghost" on:click={() => focusIssue(issue)}>定位活动</Button>
-          </article>
-        {:else}
-          <Tile class="all-clear"><h3>课程检查通过</h3><p>教学顺序、反馈与无障碍说明均已完成。</p></Tile>
-        {/each}
-        {#if diagnostics.length}
-          <div class="rule-grid">
-            <Tile><span>前置知识</span><strong>先教后用</strong><p>非音素活动使用未单独教学的音素时阻断。</p></Tile>
-            <Tile><span>相似音</span><strong>对比教学</strong><p>发现 /b/-/p/、/f/-/v/ 等音对时建议增加辨音。</p></Tile>
-            <Tile><span>例句</span><strong>≤ 12 词</strong><p>超过建议长度时提示拆分意群。</p></Tile>
-            <Tile><span>练习</span><strong>必须有反馈</strong><p>每个练习活动都要提供可行动反馈。</p></Tile>
-          </div>
-        {/if}
-      </div>
+      {#if currentRelease}
+        <div class="release-banner">
+          <Tag type="green">已发布定稿</Tag>
+          <span>检查对象：{currentRelease.label} · {formatTime(currentRelease.savedAt)} · 由 {teacherName(currentRelease.publishedBy)} 发布</span>
+          <small>草稿的后续修改不影响这里的检查结果</small>
+        </div>
+        <div class="issue-board">
+          {#each releaseDiagnostics as issue, index}
+            <article class:critical={issue.level === 'error'} class:caution={issue.level === 'warning'} class:info={issue.level === 'info'}>
+              <span class="issue-index">{String(index + 1).padStart(2, '0')}</span>
+              <div><div class="issue-meta"><Tag type={issue.level === 'error' ? 'red' : issue.level === 'warning' ? 'magenta' : 'blue'}>{issue.category}</Tag><small>{issue.level === 'error' ? '必须处理' : issue.level === 'warning' ? '建议调整' : '教学提示'}</small></div><h3>{issue.title}</h3><p>{issue.detail}</p></div>
+              <Button size="small" kind="ghost" on:click={() => focusIssue(issue)}>定位活动</Button>
+            </article>
+          {:else}
+            <Tile class="all-clear"><h3>课程检查通过</h3><p>已发布定稿的教学顺序、反馈与无障碍说明均已完成。</p></Tile>
+          {/each}
+          {#if releaseDiagnostics.length}
+            <div class="rule-grid">
+              <Tile><span>前置知识</span><strong>先教后用</strong><p>非音素活动使用未单独教学的音素时阻断。</p></Tile>
+              <Tile><span>相似音</span><strong>对比教学</strong><p>发现 /b/-/p/、/f/-/v/ 等音对时建议增加辨音。</p></Tile>
+              <Tile><span>例句</span><strong>≤ 12 词</strong><p>超过建议长度时提示拆分意群。</p></Tile>
+              <Tile><span>练习</span><strong>必须有反馈</strong><p>每个练习活动都要提供可行动反馈。</p></Tile>
+            </div>
+          {/if}
+        </div>
+      {:else}
+        <Tile class="all-clear"><h3>课程尚未发布</h3><p>由课程负责人 {teacherName(course.ownerId)} 发布定稿后，这里将检查已发布版本的活动顺序、依赖与音素说明。</p></Tile>
+      {/if}
     </main>
   {/if}
 
   {#if activeView === 'versions'}
     <main class="versions-view">
       <div class="view-heading">
-        <div><span class="kicker">REUSE & HISTORY</span><h2>版本与课程复用</h2><p>复制课程不会覆盖原课程；存档版本包含完整活动、依赖和教学说明。</p></div>
-        <div class="version-actions"><Button kind="tertiary" on:click={copyCourse}>复制课程</Button><Button kind="primary" on:click={saveVersion}>保存新版本</Button></div>
+        <div><span class="kicker">RELEASE & OWNERSHIP</span><h2>发布与版本</h2><p>只有课程负责人能发布；定稿后活动顺序、依赖与音素说明即固定，草稿修改不影响已发布内容。</p></div>
+        <div class="version-actions"><Button kind="tertiary" on:click={copyCourse}>复制课程</Button><Button kind="primary" on:click={publishCourse}>发布当前草稿</Button></div>
       </div>
+      <Tile class="publish-panel">
+        <div class="publish-facts">
+          <div><span>课程负责人</span><strong>{teacherName(course.ownerId)}</strong></div>
+          <div><span>当前教师</span><strong>{currentTeacher.name}{isOwner ? '（负责人）' : ''}</strong></div>
+          <div><span>发布状态</span><strong>{statusLabel}</strong></div>
+          <div><span>当前定稿</span><strong>{currentRelease ? `${currentRelease.label} · ${formatTime(currentRelease.savedAt)}` : '尚未发布'}</strong></div>
+        </div>
+        <p class="publish-note">发布会把当前草稿固化为定稿：质量检查与版本比较均以定稿为准。发布不可撤销，如需调整请修改草稿后再次发布；两人同时提交时只有一人成功，失败方会自动恢复。</p>
+        {#if !isOwner}
+          <InlineNotification lowContrast hideCloseButton kind="warning" title="无权发布" subtitle={`你当前以 ${currentTeacher.name} 的身份操作，只有负责人 ${teacherName(course.ownerId)} 能发布本课程，越权提交会被直接拒绝。`} />
+        {/if}
+      </Tile>
       <div class="version-layout-svelte">
         <Tile class="version-timeline">
-          <div class="section-title"><div><span class="kicker">TIMELINE</span><h3>课程版本</h3></div><Tag type="cool-gray">{course.versions.length} 个快照</Tag></div>
-          {#each course.versions as version, index (version.id)}
-            <article class:latest={index === course.versions.length - 1}>
+          <div class="section-title"><div><span class="kicker">RELEASES</span><h3>发布记录</h3></div><Tag type="cool-gray">{course.releases.length} 次发布</Tag></div>
+          {#each course.releases as release (release.id)}
+            <article class:latest={release.id === course.publishedReleaseId}>
               <span class="timeline-dot"></span>
-              <div><b>{version.label}</b><h4>{version.note}</h4><p>{formatTime(version.savedAt)} · {version.activities.length} 个活动</p></div>
+              <div>
+                <b>{release.label}</b>
+                {#if release.id === course.publishedReleaseId}<Tag type="green" size="sm">当前定稿</Tag>{/if}
+                <h4>{release.note}</h4>
+                <p>{formatTime(release.savedAt)} · {teacherName(release.publishedBy)} 发布 · {release.activities.length} 个活动</p>
+              </div>
             </article>
+          {:else}
+            <p class="empty-state">还没有发布记录。由负责人 {teacherName(course.ownerId)} 发布首个定稿。</p>
           {/each}
+          {#if course.versions.length}
+            <div class="legacy-snapshots">
+              <span class="kicker">LEGACY SNAPSHOTS</span>
+              <h4>旧版草稿快照</h4>
+              {#each course.versions as version (version.id)}
+                <p>{version.label} · {formatTime(version.savedAt)} · {version.activities.length} 个活动（仅存档，不参与比较）</p>
+              {/each}
+            </div>
+          {/if}
         </Tile>
         <Tile class="diff-card">
-          <div class="section-title"><div><span class="kicker">COMPARE</span><h3>比较两个版本</h3></div></div>
-          <div class="compare-pickers">
-            <Select labelText="基准版本" selected={compareBaseId} on:change={(event) => compareBaseId = readText(event)}>
-              {#each course.versions as version}<SelectItem value={version.id} text={`${version.label} · ${formatTime(version.savedAt)}`} />{/each}
-            </Select>
-            <Select labelText="目标版本" selected={compareTargetId} on:change={(event) => compareTargetId = readText(event)}>
-              {#each course.versions as version}<SelectItem value={version.id} text={`${version.label} · ${formatTime(version.savedAt)}`} />{/each}
-            </Select>
-          </div>
-          <div class="diff-list">
-            {#each versionDiff as diff}
-              <article class={diff.kind}><span>{diff.kind === 'added' ? '新增' : diff.kind === 'removed' ? '删除' : '修改'}</span><div><b>{diff.title}</b><p>{diff.detail}</p></div></article>
-            {:else}
-              <p class="empty-state">两个版本之间没有活动差异，或尚未选择版本。</p>
-            {/each}
-          </div>
+          <div class="section-title"><div><span class="kicker">COMPARE</span><h3>比较已发布版本</h3></div></div>
+          {#if course.releases.length}
+            <div class="compare-pickers">
+              <Select labelText="基准版本" selected={compareBaseId} on:change={(event) => compareBaseId = readText(event)}>
+                {#each course.releases as release}<SelectItem value={release.id} text={`${release.label} · ${formatTime(release.savedAt)}`} />{/each}
+              </Select>
+              <Select labelText="目标版本" selected={compareTargetId} on:change={(event) => compareTargetId = readText(event)}>
+                {#each course.releases as release}<SelectItem value={release.id} text={`${release.label} · ${formatTime(release.savedAt)}`} />{/each}
+              </Select>
+            </div>
+            <div class="diff-list">
+              {#each versionDiff as diff}
+                <article class={diff.kind}><span>{diff.kind === 'added' ? '新增' : diff.kind === 'removed' ? '删除' : '修改'}</span><div><b>{diff.title}</b><p>{diff.detail}</p></div></article>
+              {:else}
+                <p class="empty-state">两个已发布版本之间没有活动差异；发布至少两个版本后可比较变化。</p>
+              {/each}
+            </div>
+          {:else}
+            <p class="empty-state">课程尚未发布。发布两个以上定稿后，可在此比较活动增删与字段变化。</p>
+          {/if}
         </Tile>
       </div>
     </main>
   {/if}
 
   <footer class="app-footer">
-    <span>所有数据保存在当前浏览器 localStorage</span>
+    <span>所有数据保存在当前浏览器 localStorage · 负责人与发布状态随课程一并保存</span>
     <span>Ctrl/Cmd + Z 撤销 · Ctrl/Cmd + Y 重做 · Alt + N 新建活动 · Ctrl/Cmd + S 保存</span>
   </footer>
 </div>
