@@ -9,6 +9,7 @@
     "prebuild": "svelte-kit sync",
     "prepare": "svelte-kit sync",
     "preview": "vite preview --host 0.0.0.0",
+    "test": "node scripts/run-tests.mjs",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
